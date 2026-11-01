@@ -1,0 +1,596 @@
+name: Pterodactyl Boost
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write  # push alamat tetap ke branch gh-pages
+  actions: write   # baca/hapus artifact lama + trigger sesi berikutnya
+  pages: write     # minta GitHub Pages rebuild
+
+# Hanya 1 sesi berjalan; sesi baru antre dan otomatis mulai begitu yang lama selesai
+concurrency:
+  group: pterodactyl
+  cancel-in-progress: false
+
+env:
+  BACKUP_NAME: ptero-backup
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  panel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: Cek secret
+        env:
+          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
+          ADMIN_USER: ${{ secrets.ADMIN_USER }}
+          ADMIN_PASS: ${{ secrets.ADMIN_PASS }}
+          BACKUP_PASS: ${{ secrets.BACKUP_PASS }}
+        run: |
+          for v in ADMIN_EMAIL ADMIN_USER ADMIN_PASS BACKUP_PASS; do
+            if [ -z "${!v}" ]; then
+              echo "Secret $v belum diisi!"
+              exit 1
+            fi
+          done
+          if [ ${#ADMIN_PASS} -lt 8 ]; then
+            echo "ADMIN_PASS minimal 8 karakter!"
+            exit 1
+          fi
+          if [ ${#BACKUP_PASS} -lt 20 ]; then
+            echo "BACKUP_PASS minimal 20 karakter!"
+            exit 1
+          fi
+
+      # ---------- BOOST STORAGE ----------
+      - name: Boost storage (gabung disk / + /mnt jadi 1 volume besar)
+        run: |
+          set -euo pipefail
+          echo "=== Sebelum ==="; df -h / /mnt
+
+          # 1. buang software bawaan runner yang tidak dipakai
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/powershell \
+                      /usr/share/swift /usr/local/share/boost /opt/microsoft \
+                      /usr/local/share/chromium /usr/local/lib/node_modules || true
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          sudo apt-get clean || true
+
+          # 2. matikan swap (swapfile ada di /mnt dan memakan ~4GB)
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile
+
+          # 3. gabungkan sisa ruang / dan /mnt jadi satu volume besar (LVM di atas loop file)
+          sudo apt-get install -y -qq lvm2 > /dev/null
+          MNT_RESERVE_MB=300
+          ROOT_FREE_MB=$(( $(df -k --output=avail / | tail -n1 | tr -d ' ') / 1024 ))
+          # sisakan di / : 30% dari ruang kosong, minimal 15 GB (OS, log runner, workspace)
+          ROOT_RESERVE_MB=$(( ROOT_FREE_MB * 30 / 100 ))
+          if [ "$ROOT_RESERVE_MB" -lt 15360 ]; then ROOT_RESERVE_MB=15360; fi
+          ROOT_MB=$(( ROOT_FREE_MB - ROOT_RESERVE_MB ))
+          MNT_MB=$(( $(df -k --output=avail /mnt | tail -n1 | tr -d ' ') / 1024 - MNT_RESERVE_MB ))
+          LOOPS=""
+          if [ "$ROOT_MB" -gt 2000 ]; then
+            sudo fallocate -l "${ROOT_MB}M" /pv-root.img
+            LOOPS="$LOOPS $(sudo losetup --find --show /pv-root.img)"
+          fi
+          if [ "$MNT_MB" -gt 2000 ]; then
+            sudo fallocate -l "${MNT_MB}M" /mnt/pv-mnt.img
+            LOOPS="$LOOPS $(sudo losetup --find --show /mnt/pv-mnt.img)"
+          fi
+          if [ -z "$LOOPS" ]; then
+            echo "Tidak ada ruang yang cukup untuk digabung"
+            exit 1
+          fi
+          echo "Volume besar dari: root=${ROOT_MB} MB, mnt=${MNT_MB} MB (sisa di / ~${ROOT_RESERVE_MB} MB)"
+          sudo pvcreate -ff -y $LOOPS
+          sudo vgcreate bigvg $LOOPS
+          sudo lvcreate -l 100%FREE -n biglv bigvg
+          sudo mkfs.ext4 -m0 -q -E lazy_itable_init=1,nodiscard /dev/bigvg/biglv
+          sudo mkdir -p /bigdisk
+          sudo mount /dev/bigvg/biglv /bigdisk
+          sudo chmod 777 /bigdisk
+
+          # 4. pindahkan Docker, containerd, data Wings, dan file sementara ke volume besar
+          #    (bind mount, jadi berlaku untuk image store Docker maupun containerd)
+          sudo systemctl stop docker.socket docker || true
+          sudo systemctl stop containerd || true
+          sudo rm -rf /var/lib/docker/* /var/lib/containerd/*
+          sudo mkdir -p /bigdisk/docker /bigdisk/containerd /bigdisk/pterodactyl /bigdisk/tmp \
+                        /var/lib/docker /var/lib/containerd /var/lib/pterodactyl
+          sudo chmod 777 /bigdisk/tmp
+          sudo mount --bind /bigdisk/docker /var/lib/docker
+          sudo mount --bind /bigdisk/containerd /var/lib/containerd
+          sudo mount --bind /bigdisk/pterodactyl /var/lib/pterodactyl
+          sudo systemctl start containerd || true
+          sudo systemctl start docker
+          echo "TMPDIR=/bigdisk/tmp" >> "$GITHUB_ENV"
+          docker info --format 'Docker root: {{.DockerRootDir}}'
+          mount | grep -E 'bigdisk' || true
+
+          # 5. hitung kapasitas node dari ruang yang tersedia
+          BIG_MB=$(( $(df -k --output=avail /bigdisk | tail -n1 | tr -d ' ') / 1024 ))
+          MEM_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+          NODE_DISK=$((BIG_MB - 15000))
+          if [ "$NODE_DISK" -lt 5000 ]; then NODE_DISK=5000; fi
+          if [ "$NODE_DISK" -gt 100000 ]; then NODE_DISK=100000; fi
+          NODE_MEM=$((MEM_MB - 2500))
+          if [ "$NODE_MEM" -lt 1500 ]; then NODE_MEM=1500; fi
+          echo "NODE_DISK=$NODE_DISK" >> "$GITHUB_ENV"
+          echo "NODE_MEM=$NODE_MEM" >> "$GITHUB_ENV"
+
+          echo "=== Sesudah ==="; df -h / /mnt /bigdisk
+          echo "Kapasitas node: RAM ${NODE_MEM} MB, disk ${NODE_DISK} MB"
+
+      - name: Penjaga disk / (anti "No space left on device")
+        run: |
+          cat > /bigdisk/guard.sh <<'GEOF'
+          #!/bin/bash
+          while true; do
+            AVAIL_MB=$(( $(df -k --output=avail / | tail -n1 | tr -d ' ') / 1024 ))
+            if [ "$AVAIL_MB" -lt 3000 ]; then
+              echo "$(date -u +%T) disk / tinggal ${AVAIL_MB}MB -> bersihkan" >> /bigdisk/guard.log
+              sudo journalctl --vacuum-size=20M > /dev/null 2>&1
+              sudo apt-get clean > /dev/null 2>&1
+              sudo rm -rf /var/log/*.gz /var/log/*.[0-9] 2>/dev/null
+              sudo find /home/runner/actions-runner -name '*.log' -size +50M -exec truncate -s 0 {} + 2>/dev/null
+            fi
+            sleep 30
+          done
+          GEOF
+          chmod +x /bigdisk/guard.sh
+          nohup /bigdisk/guard.sh > /dev/null 2>&1 &
+          df -h /
+
+      - name: Install cloudflared
+        run: |
+          curl -fsSL -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+
+      - name: Start tunnel panel dan node (quick tunnel)
+        run: |
+          nohup cloudflared tunnel --no-autoupdate --url http://localhost:8080 > tunnel-panel.log 2>&1 &
+          nohup cloudflared tunnel --no-autoupdate --url http://localhost:8081 > tunnel-node.log 2>&1 &
+          get_url() {
+            local f="$1" u=""
+            for i in $(seq 1 30); do
+              u=$(grep -o 'https://[-a-z0-9]*\.trycloudflare\.com' "$f" | head -n1 || true)
+              [ -n "$u" ] && break
+              sleep 2
+            done
+            echo "$u"
+          }
+          PANEL_URL=$(get_url tunnel-panel.log)
+          NODE_URL=$(get_url tunnel-node.log)
+          if [ -z "$PANEL_URL" ] || [ -z "$NODE_URL" ]; then
+            echo "--- tunnel panel ---"; cat tunnel-panel.log
+            echo "--- tunnel node ---"; cat tunnel-node.log
+            echo "Tunnel gagal dibuat"
+            exit 1
+          fi
+          echo "PANEL_URL=$PANEL_URL" >> "$GITHUB_ENV"
+          echo "NODE_FQDN=${NODE_URL#https://}" >> "$GITHUB_ENV"
+          echo "Panel: $PANEL_URL"
+          echo "Node : ${NODE_URL#https://}"
+          {
+            echo "### URL panel: $PANEL_URL"
+            echo "### FQDN node: ${NODE_URL#https://}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Buat docker-compose
+        run: |
+          # password database acak tiap sesi, disembunyikan dari log
+          ROOT_PASS=$(openssl rand -hex 20)
+          DB_PASS=$(openssl rand -hex 20)
+          echo "::add-mask::$ROOT_PASS"
+          echo "::add-mask::$DB_PASS"
+          echo "ROOT_PASS=$ROOT_PASS" >> "$GITHUB_ENV"
+          echo "DB_PASS=$DB_PASS" >> "$GITHUB_ENV"
+          mkdir -p panel/data/var panel/data/nginx panel/data/logs panel/data/db
+          cd panel
+          # client mysql di image panel memaksa SSL, MariaDB 10.5 tidak support -> matikan
+          printf '[client]\nskip-ssl\n\n[mysql]\nskip-ssl\n\n[mariadb-client]\nskip-ssl\n' > skip-ssl.cnf
+          cat > docker-compose.yml <<EOF
+          services:
+            database:
+              image: mariadb:10.5
+              restart: always
+              environment:
+                MYSQL_DATABASE: panel
+                MYSQL_USER: pterodactyl
+                MYSQL_PASSWORD: ${DB_PASS}
+                MYSQL_ROOT_PASSWORD: ${ROOT_PASS}
+              volumes:
+                - ./data/db:/var/lib/mysql
+            cache:
+              image: redis:alpine
+              restart: always
+            panel:
+              image: ghcr.io/pterodactyl/panel:latest
+              restart: always
+              ports:
+                - "8080:80"
+              depends_on:
+                - database
+                - cache
+              volumes:
+                - ./data/var:/app/var
+                - ./data/nginx:/etc/nginx/http.d
+                - ./data/logs:/app/storage/logs
+                - ./skip-ssl.cnf:/etc/my.cnf.d/skip-ssl.cnf:ro
+              environment:
+                APP_URL: "${PANEL_URL}"
+                APP_ENV: production
+                APP_TIMEZONE: Asia/Jakarta
+                APP_SERVICE_AUTHOR: "admin@example.com"
+                TRUSTED_PROXIES: "*"
+                DB_HOST: database
+                DB_PORT: 3306
+                DB_DATABASE: panel
+                DB_USERNAME: pterodactyl
+                DB_PASSWORD: ${DB_PASS}
+                CACHE_DRIVER: redis
+                SESSION_DRIVER: redis
+                QUEUE_DRIVER: redis
+                REDIS_HOST: cache
+                MAIL_DRIVER: log
+          networks:
+            default:
+              ipam:
+                config:
+                  - subnet: 10.77.0.0/24
+          EOF
+
+      # ---------- RESTORE DATA SESI SEBELUMNYA ----------
+      - name: Cari dan pulihkan backup terakhir
+        id: fetch
+        env:
+          BACKUP_PASS: ${{ secrets.BACKUP_PASS }}
+        run: |
+          ID=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=${BACKUP_NAME}&per_page=20" \
+                --jq '[.artifacts[] | select(.expired==false)][0].id // empty')
+          if [ -z "$ID" ]; then
+            echo "Tidak ada backup lama, mulai dari nol."
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          W=/bigdisk/tmp/restore-work
+          sudo rm -rf "$W" && sudo mkdir -p "$W" && sudo chmod 777 "$W"
+          gh api "repos/${{ github.repository }}/actions/artifacts/$ID/zip" > "$W/backup.zip"
+          unzip -o -q "$W/backup.zip" -d "$W"
+          sudo mkdir -p "$W/x"
+          gpg --batch --yes --passphrase "$BACKUP_PASS" -d "$W/${BACKUP_NAME}.tar.gz.gpg" | sudo tar xz -C "$W/x"
+          test -s "$W/x/dump.sql"
+          sudo cp "$W/x/dump.sql" panel/dump.sql
+          sudo cp -a "$W/x/data/." panel/data/
+          if [ -d "$W/x/var/lib/pterodactyl/volumes" ]; then
+            sudo mkdir -p /var/lib/pterodactyl
+            sudo cp -a "$W/x/var/lib/pterodactyl/volumes" /var/lib/pterodactyl/
+          fi
+          sudo rm -rf "$W"
+          echo "restored=true" >> "$GITHUB_OUTPUT"
+          echo "Backup dipulihkan (artifact $ID)."
+
+      - name: Jalankan database dan redis
+        working-directory: panel
+        run: |
+          docker compose up -d database cache
+          ready=false
+          for i in $(seq 1 40); do
+            if docker compose exec -T database mysqladmin ping -uroot -p"$ROOT_PASS" --silent; then
+              ready=true
+              break
+            fi
+            echo "[$i/40] menunggu database..."
+            sleep 3
+          done
+          if [ "$ready" != "true" ]; then
+            docker compose logs --tail=50 database
+            exit 1
+          fi
+
+      - name: Import database lama
+        if: steps.fetch.outputs.restored == 'true'
+        working-directory: panel
+        run: |
+          docker compose exec -T database mysql -uroot -p"$ROOT_PASS" panel < dump.sql
+          echo "Database dipulihkan."
+
+      - name: Jalankan panel (tunggu sampai siap)
+        working-directory: panel
+        run: |
+          # pastikan folder mount bisa ditulis oleh user php di dalam container
+          sudo chmod -R 777 data/var data/logs data/nginx
+          docker compose up -d panel
+          # sembunyikan APP_KEY dan HASHIDS_SALT dari log (penting untuk repo publik)
+          for i in $(seq 1 30); do
+            if grep -q '^APP_KEY=' data/var/.env 2>/dev/null; then break; fi
+            sleep 1
+          done
+          sleep 3
+          for k in APP_KEY HASHIDS_SALT; do
+            v=$(grep "^$k=" data/var/.env 2>/dev/null | head -n1 | cut -d= -f2- || true)
+            if [ -n "$v" ]; then echo "::add-mask::$v"; fi
+          done
+          ok=false
+          for i in $(seq 1 120); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/auth/login || true)
+            echo "[$i/120] HTTP $code"
+            if [ "$code" = "200" ]; then
+              ok=true
+              break
+            fi
+            sleep 5
+          done
+          if [ "$ok" != "true" ]; then
+            echo "===== LOG CONTAINER PANEL ====="
+            docker compose logs --tail=150 panel 2>&1 | sed -E -e 's/((app key|hashids salt)[^:]*: ).*/\1[hidden]/I' -e 's/(APP_KEY=).*/\1[hidden]/'
+            echo "===== LOG LARAVEL ====="
+            docker compose exec -T panel sh -c 'tail -n 60 /app/storage/logs/*.log' || true
+            echo "===== ISI RESPON HALAMAN ====="
+            curl -s http://localhost:8080/auth/login | head -c 1500 || true
+            exit 1
+          fi
+
+      - name: Migrasi database (aman diulang)
+        working-directory: panel
+        run: |
+          ok=false
+          for i in $(seq 1 10); do
+            if docker compose exec -T panel php artisan migrate --seed --force; then
+              ok=true
+              break
+            fi
+            echo "[$i/10] migrasi gagal, coba lagi..."
+            sleep 10
+          done
+          if [ "$ok" != "true" ]; then
+            docker compose logs --tail=100 panel 2>&1 | sed -E -e 's/((app key|hashids salt)[^:]*: ).*/\1[hidden]/I' -e 's/(APP_KEY=).*/\1[hidden]/'
+            exit 1
+          fi
+
+      - name: Buat user admin (kalau belum ada user)
+        working-directory: panel
+        env:
+          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
+          ADMIN_USER: ${{ secrets.ADMIN_USER }}
+          ADMIN_PASS: ${{ secrets.ADMIN_PASS }}
+        run: |
+          COUNT=$(docker compose exec -T database mysql -uroot -p"$ROOT_PASS" -N -s panel \
+                    -e "SELECT COUNT(*) FROM users;" | tr -d '\r\n')
+          echo "Jumlah user saat ini: $COUNT"
+          if [ "$COUNT" = "0" ]; then
+            docker compose exec -T panel php artisan p:user:make \
+              --email="$ADMIN_EMAIL" --username="$ADMIN_USER" \
+              --name-first=Admin --name-last=Panel \
+              --password="$ADMIN_PASS" --admin=1
+          else
+            echo "User sudah ada, lewati pembuatan admin."
+          fi
+          # tandai panel sehat -> backup boleh dibuat
+          echo "PANEL_READY=true" >> "$GITHUB_ENV"
+
+      # ---------- ALAMAT TETAP (GitHub Pages) ----------
+      # https://<username>.github.io/<repo>/ selalu mengarah ke alamat panel yang sedang aktif.
+      - name: Publikasikan alamat tetap (GitHub Pages)
+        continue-on-error: true
+        env:
+          PAGES_DOMAIN: ${{ vars.PAGES_DOMAIN }}
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+          rm -rf /tmp/pages && mkdir /tmp/pages && cd /tmp/pages
+          git init -q
+          git checkout -q -b gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cat > index.html <<HTML
+          <!doctype html>
+          <html lang="id"><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>Panel</title>
+          <noscript><meta http-equiv="refresh" content="0; url=${PANEL_URL}"></noscript>
+          <style>body{font-family:system-ui,sans-serif;display:grid;place-content:center;height:100vh;margin:0;text-align:center}</style>
+          </head><body>
+          <div><h3>Mengarahkan ke panel...</h3><p><a id="l" href="${PANEL_URL}">Klik di sini kalau tidak berpindah</a></p></div>
+          <script>
+          fetch("url.json?t="+Date.now(),{cache:"no-store"}).then(function(r){return r.json()}).then(function(d){
+            if(d.panel){document.getElementById("l").href=d.panel;location.replace(d.panel);}
+          }).catch(function(){location.replace("${PANEL_URL}");});
+          </script>
+          </body></html>
+          HTML
+          cp index.html 404.html
+          printf '{"panel":"%s","updated":"%s"}\n' "$PANEL_URL" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > url.json
+          touch .nojekyll
+          # custom domain GitHub Pages disimpan di file CNAME; harus ikut tiap push
+          if [ -n "${PAGES_DOMAIN:-}" ]; then echo "$PAGES_DOMAIN" > CNAME; fi
+          git add -A
+          git commit -q -m "update alamat panel"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          git push -q -f origin gh-pages
+          gh api -X POST "repos/${REPO}/pages/builds" > /dev/null 2>&1 || true
+          echo "Alamat tetap diperbarui."
+
+      # ---------- NODE (WINGS) ----------
+      - name: Siapkan node di panel + config Wings
+        working-directory: panel
+        run: |
+          q() {
+            docker compose exec -T database mysql -uroot -p"$ROOT_PASS" -N -s panel -e "$1" | tr -d '\r\n'
+          }
+
+          NODE_COUNT=$(q "SELECT COUNT(*) FROM nodes;")
+          if [ "$NODE_COUNT" = "0" ]; then
+            if [ "$(q 'SELECT COUNT(*) FROM locations;')" = "0" ]; then
+              docker compose exec -T panel php artisan p:location:make --short=gh --long="GitHub Runner"
+            fi
+            LOCID=$(q "SELECT id FROM locations ORDER BY id LIMIT 1;")
+            docker compose exec -T panel php artisan p:node:make \
+              --name="Node-GH" --description="Wings di GitHub Actions" \
+              --locationId="$LOCID" --fqdn="$NODE_FQDN" \
+              --public=1 --scheme=https --proxy=1 --maintenance=0 \
+              --maxMemory="$NODE_MEM" --overallocateMemory=0 \
+              --maxDisk="$NODE_DISK" --overallocateDisk=0 \
+              --uploadSize=100 --daemonListeningPort=443 --daemonSFTPPort=2022 \
+              --daemonBase=/var/lib/pterodactyl/volumes
+          else
+            # FQDN berubah tiap sesi (quick tunnel) dan kapasitas bisa beda -> update node lama
+            q "UPDATE nodes SET fqdn='$NODE_FQDN', memory=$NODE_MEM, disk=$NODE_DISK ORDER BY id LIMIT 1;"
+            echo "Node diperbarui: fqdn=$NODE_FQDN ram=$NODE_MEM disk=$NODE_DISK"
+          fi
+
+          NODE_ID=$(q "SELECT id FROM nodes ORDER BY id LIMIT 1;")
+          echo "NODE_ID=$NODE_ID"
+
+          # allocation otomatis (port 30000-30019) kalau belum ada
+          if [ "$(q "SELECT COUNT(*) FROM allocations WHERE node_id=$NODE_ID;")" = "0" ]; then
+            q "INSERT INTO allocations (node_id, ip, port, created_at, updated_at) SELECT $NODE_ID, '0.0.0.0', seq, NOW(), NOW() FROM seq_30000_to_30019;" \
+              || echo "Gagal buat allocation otomatis, buat manual di panel."
+          fi
+
+          docker compose exec -T panel php artisan p:node:configuration "$NODE_ID" --format=yml | tr -d '\r' > ../wings-config.yml
+          test -s ../wings-config.yml
+
+          # port API lokal wings -> 8081 (di-tunnel)
+          sed -i -E 's/^(\s+)port: 443$/\1port: 8081/' ../wings-config.yml
+          # wings 1 mesin dengan panel -> akses panel lokal
+          sed -i -E "s#^remote: .*#remote: 'http://localhost:8080'#" ../wings-config.yml
+
+          sudo mkdir -p /etc/pterodactyl /var/lib/pterodactyl/volumes /tmp/pterodactyl
+          sudo cp ../wings-config.yml /etc/pterodactyl/config.yml
+
+      - name: Kunci jaringan container user (anti-abuse)
+        run: |
+          NET=172.18.0.0/16   # network Docker milik Wings (pterodactyl_nw)
+          # 1. container tidak boleh membuka koneksi baru ke runner (panel, wings, docker)
+          sudo iptables -I INPUT -s "$NET" -m conntrack --ctstate NEW -j DROP
+          # 2. container tidak boleh akses network panel/database dan metadata cloud
+          sudo iptables -I DOCKER-USER -s "$NET" -d 10.77.0.0/24 -j DROP
+          sudo iptables -I DOCKER-USER -s "$NET" -d 169.254.0.0/16 -j DROP
+          sudo iptables -I DOCKER-USER -s "$NET" -d 168.63.129.16/32 -j DROP
+          # 3. blokir port spam email dan mining pool umum
+          sudo iptables -I DOCKER-USER -s "$NET" -p tcp -m multiport \
+            --dports 25,465,587,3333,4444,5555,7777,14433,14444,45700 -j REJECT
+          # 4. batasi koneksi baru per container (anti scan / DDoS keluar)
+          sudo iptables -I DOCKER-USER -s "$NET" -m conntrack --ctstate NEW \
+            -m hashlimit --hashlimit-name ptero_out --hashlimit-mode srcip \
+            --hashlimit-above 60/sec --hashlimit-burst 120 -j DROP
+          sudo iptables -L DOCKER-USER -n --line-numbers
+
+      - name: Install dan jalankan Wings
+        run: |
+          sudo curl -fsSL -o /usr/local/bin/wings https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_amd64
+          sudo chmod +x /usr/local/bin/wings
+          sudo nohup wings --config /etc/pterodactyl/config.yml > wings.log 2>&1 &
+          ok=false
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8081/api/system || true)
+            echo "[$i/30] wings HTTP $code"
+            if [ "$code" != "000" ]; then
+              ok=true
+              break
+            fi
+            sleep 3
+          done
+          if [ "$ok" != "true" ]; then
+            echo "===== LOG WINGS ====="
+            cat wings.log
+            exit 1
+          fi
+          echo "Wings berjalan."
+
+      - name: Panel dan node aktif
+        run: |
+          echo "=== Pemakaian disk ==="; df -h / /bigdisk
+          echo "Panel: $PANEL_URL"
+          echo "Node : $NODE_FQDN"
+          sleep 320m
+
+      # ---------- BACKUP SAAT SESI HABIS / DIBATALKAN ----------
+      # Hanya jalan kalau panel sempat sehat, supaya backup kosong
+      # tidak menimpa backup bagus.
+      - name: Backup data
+        if: always() && env.PANEL_READY == 'true'
+        working-directory: panel
+        env:
+          BACKUP_PASS: ${{ secrets.BACKUP_PASS }}
+        run: |
+          rm -f dump.sql
+          docker compose exec -T database mysqldump -uroot -p"$ROOT_PASS" \
+            --single-transaction panel > dump.sql
+          test -s dump.sql
+          # hentikan wings + server di node supaya file konsisten
+          sudo pkill -TERM wings || true
+          docker ps -q --filter network=pterodactyl_nw | xargs -r docker stop -t 20
+          sudo mkdir -p /var/lib/pterodactyl/volumes
+          # file server ikut di-backup hanya kalau cukup kecil untuk artifact
+          VOL_MB=$(sudo du -sm /var/lib/pterodactyl/volumes | cut -f1)
+          VOL_ARGS=()
+          if [ "$VOL_MB" -gt 1500 ]; then
+            echo "Volume server ${VOL_MB} MB terlalu besar untuk artifact, file server TIDAK ikut di-backup (database tetap)."
+          else
+            VOL_ARGS=(-C / var/lib/pterodactyl/volumes)
+          fi
+          sudo tar --warning=no-file-changed -czf - \
+              -C . dump.sql data/var data/nginx \
+              "${VOL_ARGS[@]}" \
+            | gpg --batch --yes --symmetric --cipher-algo AES256 \
+                  --s2k-mode 3 --s2k-digest-algo SHA512 --s2k-count 65011712 \
+                  --passphrase "$BACKUP_PASS" -o /bigdisk/${BACKUP_NAME}.tar.gz.gpg
+          ls -lh /bigdisk/${BACKUP_NAME}.tar.gz.gpg
+
+      - name: Upload backup
+        if: always() && env.PANEL_READY == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ptero-backup
+          path: /bigdisk/ptero-backup.tar.gz.gpg
+          retention-days: 7
+          compression-level: 0
+
+      - name: Hapus backup lama (sisakan 2 terbaru)
+        if: always() && env.PANEL_READY == 'true'
+        run: |
+          gh api "repos/${{ github.repository }}/actions/artifacts?name=${BACKUP_NAME}&per_page=50" \
+            --jq '.artifacts[2:][].id' | while read -r id; do
+            gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" || true
+          done
+
+      - name: Log (kalau gagal)
+        if: failure()
+        run: |
+          echo "===== DISK ====="
+          df -h / /mnt /bigdisk 2>/dev/null || true
+          cat /bigdisk/guard.log 2>/dev/null || true
+          sudo du -xh --max-depth=2 / 2>/dev/null | sort -rh | head -15 || true
+          echo "===== LOG PANEL ====="
+          (cd panel && docker compose logs --tail=150 panel 2>&1 | sed -E -e 's/((app key|hashids salt)[^:]*: ).*/\1[hidden]/I' -e 's/(APP_KEY=).*/\1[hidden]/') || true
+          echo "===== LOG WINGS ====="
+          tail -n 100 wings.log || true
+
+      # ---------- NYALA LAGI OTOMATIS ----------
+      # Jalan setelah sukses MAUPUN gagal. Tidak jalan kalau kamu cancel manual,
+      # atau kalau variabel repo AUTO_RESTART diisi 'false' (tombol stop).
+      - name: Restart otomatis (sesi berikutnya)
+        if: always() && !cancelled() && vars.AUTO_RESTART != 'false'
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          REPO="${{ github.repository }}"
+          if [ "$JOB_STATUS" != "success" ]; then
+            PREV=$(gh run list --repo "$REPO" --workflow "$GITHUB_WORKFLOW" --status completed --limit 1 \
+                      --json conclusion -q '.[0].conclusion // empty')
+            if [ "$PREV" = "failure" ]; then
+              echo "2 run gagal berturut-turut. Rantai dihentikan supaya tidak boros menit."
+              echo "Perbaiki errornya lalu jalankan workflow manual."
+              exit 0
+            fi
+            echo "Run gagal, coba 1x lagi setelah 60 detik..."
+            sleep 60
+          fi
+          gh workflow run "$GITHUB_WORKFLOW" --repo "$REPO" --ref "${{ github.ref_name }}"
+          echo "Sesi berikutnya sudah di-trigger."
