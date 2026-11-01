@@ -1,0 +1,180 @@
+name: Pterodactyl Panel + Cloudflared (auto backup)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write   # baca artifact lama + trigger sesi berikutnya
+
+# Hanya 1 sesi berjalan; sesi baru antre sampai yang lama selesai
+concurrency:
+  group: pterodactyl
+  cancel-in-progress: false
+
+env:
+  BACKUP_NAME: ptero-backup
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  panel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: Install cloudflared
+        run: |
+          curl -fsSL -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+
+      - name: Start tunnel
+        run: |
+          nohup cloudflared tunnel --no-autoupdate --url http://localhost:8080 > tunnel.log 2>&1 &
+          for i in $(seq 1 30); do
+            URL=$(grep -o 'https://[-a-z0-9]*\.trycloudflare\.com' tunnel.log | head -n1 || true)
+            [ -n "$URL" ] && break
+            sleep 2
+          done
+          [ -z "$URL" ] && { cat tunnel.log; echo "Tunnel gagal"; exit 1; }
+          echo "PANEL_URL=$URL" >> "$GITHUB_ENV"
+          echo "URL panel: $URL"
+
+      - name: Buat docker-compose
+        run: |
+          mkdir -p panel && cd panel
+          cat > docker-compose.yml <<EOF
+          services:
+            database:
+              image: mariadb:10.5
+              restart: always
+              environment:
+                MYSQL_DATABASE: panel
+                MYSQL_USER: pterodactyl
+                MYSQL_PASSWORD: ptero_db_pass
+                MYSQL_ROOT_PASSWORD: ptero_root_pass
+              volumes:
+                - ./data/db:/var/lib/mysql
+            cache:
+              image: redis:alpine
+              restart: always
+            panel:
+              image: ghcr.io/pterodactyl/panel:latest
+              restart: always
+              ports:
+                - "8080:80"
+              depends_on:
+                - database
+                - cache
+              volumes:
+                - ./data/var:/app/var
+                - ./data/nginx:/etc/nginx/http.d
+                - ./data/logs:/app/storage/logs
+              environment:
+                APP_URL: "${PANEL_URL}"
+                APP_ENV: production
+                APP_TIMEZONE: Asia/Jakarta
+                APP_SERVICE_AUTHOR: "admin@example.com"
+                TRUSTED_PROXIES: "*"
+                DB_HOST: database
+                DB_PORT: 3306
+                DB_DATABASE: panel
+                DB_USERNAME: pterodactyl
+                DB_PASSWORD: ptero_db_pass
+                CACHE_DRIVER: redis
+                SESSION_DRIVER: redis
+                QUEUE_DRIVER: redis
+                REDIS_HOST: cache
+                MAIL_DRIVER: log
+          EOF
+
+      # ---------- RESTORE DATA SESI SEBELUMNYA ----------
+      - name: Cari & unduh backup terakhir
+        id: fetch
+        env:
+          BACKUP_PASS: ${{ secrets.BACKUP_PASS }}
+        run: |
+          ID=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=${BACKUP_NAME}&per_page=20" \
+                --jq '[.artifacts[] | select(.expired==false)][0].id // empty')
+          if [ -z "$ID" ]; then
+            echo "Tidak ada backup lama, mulai dari nol."
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh api "repos/${{ github.repository }}/actions/artifacts/$ID/zip" > backup.zip
+          unzip -o backup.zip
+          gpg --batch --yes --passphrase "$BACKUP_PASS" -d ${BACKUP_NAME}.tar.gz.gpg | sudo tar xz -C panel
+          echo "restored=true" >> "$GITHUB_OUTPUT"
+          echo "Backup berhasil dipulihkan (artifact $ID)."
+
+      - name: Jalankan database & redis
+        working-directory: panel
+        run: |
+          mkdir -p data/var data/nginx data/logs data/db
+          docker compose up -d database cache
+          for i in $(seq 1 40); do
+            docker compose exec -T database mysqladmin ping -uroot -pptero_root_pass --silent && break
+            sleep 3
+          done
+
+      - name: Import database lama
+        if: steps.fetch.outputs.restored == 'true'
+        working-directory: panel
+        run: |
+          docker compose exec -T database mysql -uroot -pptero_root_pass panel < dump.sql
+          echo "Database dipulihkan."
+
+      - name: Jalankan panel
+        working-directory: panel
+        run: |
+          docker compose up -d panel
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/auth/login || true)
+            [ "$code" = "200" ] && break
+            sleep 5
+          done
+
+      - name: Buat user admin (hanya sesi pertama)
+        if: steps.fetch.outputs.restored != 'true'
+        working-directory: panel
+        env:
+          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
+          ADMIN_USER: ${{ secrets.ADMIN_USER }}
+          ADMIN_PASS: ${{ secrets.ADMIN_PASS }}
+        run: |
+          docker compose exec -T panel php artisan p:user:make \
+            --email="$ADMIN_EMAIL" --username="$ADMIN_USER" \
+            --name-first=Admin --name-last=Panel \
+            --password="$ADMIN_PASS" --admin=1
+
+      - name: Panel aktif
+        run: |
+          echo "Panel aktif di: $PANEL_URL"
+          sleep 335m
+
+      # ---------- BACKUP SAAT SESI HABIS / DIBATALKAN ----------
+      - name: Backup data
+        if: always()
+        working-directory: panel
+        env:
+          BACKUP_PASS: ${{ secrets.BACKUP_PASS }}
+        run: |
+          docker compose exec -T database mysqldump -uroot -pptero_root_pass \
+            --single-transaction panel > dump.sql
+          sudo tar czf - dump.sql data/var data/nginx \
+            | gpg --batch --yes --symmetric --cipher-algo AES256 \
+                  --passphrase "$BACKUP_PASS" -o ../${BACKUP_NAME}.tar.gz.gpg
+          ls -lh ../${BACKUP_NAME}.tar.gz.gpg
+
+      - name: Upload backup
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ptero-backup
+          path: ptero-backup.tar.gz.gpg
+          retention-days: 30
+          compression-level: 0
+
+      # ---------- LANGSUNG LANJUT KE SESI BERIKUTNYA ----------
+      - name: Trigger sesi berikutnya
+        if: success()
+        run: gh workflow run "${{ github.workflow }}" --repo "${{ github.repository }}" --ref "${{ github.ref_name }}"
