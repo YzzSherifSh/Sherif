@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="id"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Panel</title>
+<noscript><meta http-equiv="refresh" content="0; url=https://alaska-rpg-consolidated-shaft.trycloudflare.com"></noscript>
+<style>body{font-family:system-ui,sans-serif;display:grid;place-content:center;height:100vh;margin:0;text-align:center}</style>
+</head><body>
+<div><h3>Mengarahkan ke panel...</h3><p><a id="l" href="https://alaska-rpg-consolidated-shaft.trycloudflare.com">Klik di sini kalau tidak berpindah</a></p></div>
+<script>
+fetch("url.json?t="+Date.now(),{cache:"no-store"}).then(function(r){return r.json()}).then(function(d){
+  if(d.panel){document.getElementById("l").href=d.panel;location.replace(d.panel);}
+}).catch(function(){location.replace("https://alaska-rpg-consolidated-shaft.trycloudflare.com");});
+</script>
+</body></html>
