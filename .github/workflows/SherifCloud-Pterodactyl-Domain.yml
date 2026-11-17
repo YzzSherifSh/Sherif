@@ -442,6 +442,7 @@ jobs:
         run: |
           set -euo pipefail
           REPO="${{ github.repository }}"
+          UPDATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           rm -rf /tmp/pages && mkdir /tmp/pages && cd /tmp/pages
           git init -q
           git checkout -q -b gh-pages
@@ -449,22 +450,284 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           cat > index.html <<HTML
           <!doctype html>
-          <html lang="id"><head><meta charset="utf-8">
-          <meta name="viewport" content="width=device-width,initial-scale=1">
-          <title>Panel</title>
-          <noscript><meta http-equiv="refresh" content="0; url=${PANEL_URL}"></noscript>
-          <style>body{font-family:system-ui,sans-serif;display:grid;place-content:center;height:100vh;margin:0;text-align:center}</style>
-          </head><body>
-          <div><h3>Mengarahkan ke panel...</h3><p><a id="l" href="${PANEL_URL}">Klik di sini kalau tidak berpindah</a></p></div>
-          <script>
-          fetch("url.json?t="+Date.now(),{cache:"no-store"}).then(function(r){return r.json()}).then(function(d){
-            if(d.panel){document.getElementById("l").href=d.panel;location.replace(d.panel);}
-          }).catch(function(){location.replace("${PANEL_URL}");});
-          </script>
-          </body></html>
+          <html lang="id">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width,initial-scale=1">
+            <meta name="color-scheme" content="dark">
+            <title>ptero // gateway</title>
+            <style>
+              * { box-sizing: border-box; margin: 0; padding: 0; }
+              body {
+                background: #0a0a0a;
+                color: #e4e4e7;
+                font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+                font-size: 13px;
+                line-height: 1.6;
+                min-height: 100dvh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 24px;
+              }
+              main {
+                width: 100%;
+                max-width: 500px;
+                border-left: 2px solid #27272a;
+                padding-left: 18px;
+                transition: border-color 0.2s;
+              }
+              main.online { border-left-color: #22c55e; }
+              main.offline { border-left-color: #ef4444; }
+              .head {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                color: #a1a1aa;
+                margin-bottom: 14px;
+                font-size: 12px;
+              }
+              .dot {
+                width: 6px;
+                height: 6px;
+                background: #eab308;
+                display: inline-block;
+              }
+              .online .dot { background: #22c55e; }
+              .offline .dot { background: #ef4444; }
+              h1 {
+                font-size: 15px;
+                font-weight: 600;
+                color: #fafafa;
+                margin-bottom: 4px;
+              }
+              p { color: #71717a; margin-bottom: 16px; }
+              .alert {
+                display: none;
+                background: #180c0c;
+                border: 1px solid #7f1d1d;
+                color: #fca5a5;
+                padding: 12px 14px;
+                margin-bottom: 16px;
+                font-size: 12px;
+              }
+              .offline .alert { display: block; }
+              .alert strong { color: #f87171; display: block; margin-bottom: 4px; }
+              .tos-box {
+                background: #111113;
+                border: 1px solid #27272a;
+                padding: 12px 14px;
+                margin-bottom: 16px;
+                font-size: 12px;
+              }
+              .tos-title {
+                color: #fafafa;
+                font-weight: 600;
+                margin-bottom: 8px;
+              }
+              .tos-list {
+                list-style: none;
+                color: #a1a1aa;
+                margin-bottom: 12px;
+              }
+              .tos-list li {
+                margin-bottom: 4px;
+                padding-left: 14px;
+                position: relative;
+              }
+              .tos-list li::before {
+                content: "-";
+                position: absolute;
+                left: 0;
+                color: #52525b;
+              }
+              .agree {
+                display: flex;
+                align-items: flex-start;
+                gap: 8px;
+                color: #e4e4e7;
+                cursor: pointer;
+                user-select: none;
+                padding-top: 8px;
+                border-top: 1px solid #1f1f23;
+              }
+              .agree input {
+                margin-top: 3px;
+                accent-color: #fafafa;
+                cursor: pointer;
+              }
+              table {
+                width: 100%;
+                border-collapse: collapse;
+                margin-bottom: 18px;
+                font-size: 12px;
+              }
+              td { padding: 3px 0; vertical-align: top; }
+              td:first-child { color: #71717a; width: 78px; }
+              td:last-child { color: #d4d4d8; word-break: break-all; }
+              .actions { display: flex; gap: 10px; flex-wrap: wrap; }
+              a, button {
+                display: inline-block;
+                color: #0a0a0a;
+                background: #fafafa;
+                text-decoration: none;
+                font-family: inherit;
+                font-weight: 600;
+                font-size: 12px;
+                padding: 7px 14px;
+                border: none;
+                cursor: pointer;
+              }
+              a:hover, button:hover { background: #d4d4d8; }
+              a.disabled {
+                background: #27272a;
+                color: #71717a;
+                pointer-events: none;
+              }
+              button.secondary {
+                background: #18181b;
+                color: #e4e4e7;
+                border: 1px solid #27272a;
+              }
+              button.secondary:hover { background: #27272a; }
+            </style>
+          </head>
+          <body>
+            <main id="box">
+              <div class="head"><span class="dot"></span><span id="badge">checking tunnel...</span></div>
+              <h1>Pterodactyl Panel</h1>
+              <p id="msg">memeriksa koneksi ke endpoint aktif...</p>
+
+              <div class="alert" id="err-box">
+                <strong>[!] SERVER OFFLINE / TIDAK DAPAT DIAKSES</strong>
+                Sesi runner sedang berganti, restart otomatis, atau berhenti. Coba muat ulang beberapa saat lagi.
+              </div>
+
+              <div class="tos-box">
+                <div class="tos-title">RULES &amp; BATAS PENGGUNAAN (TOS)</div>
+                <ul class="tos-list">
+                  <li>Alokasi wajar per user: maks <strong>RAM 400 MB</strong> &amp; <strong>Disk 2 GB</strong>.</li>
+                  <li>Dilarang menjalankan script DDoS, flooder, port scanner, botnet, atau crypto mining.</li>
+                  <li>Dilarang spam traffic keluar atau menyalahgunakan resource runner.</li>
+                  <li>Pelanggaran aturan berakibat suspend server &amp; hapus akun permanen tanpa pemberitahuan.</li>
+                </ul>
+                <label class="agree">
+                  <input type="checkbox" id="tos-chk">
+                  <span>Saya paham dan setuju mematuhi aturan penggunaan di atas.</span>
+                </label>
+              </div>
+
+              <table>
+                <tr><td>status</td><td id="st">checking...</td></tr>
+                <tr><td>quota</td><td>RAM 400 MB / Disk 2 GB</td></tr>
+                <tr><td>target</td><td id="ep">${PANEL_URL}</td></tr>
+                <tr><td>node</td><td>Node-GH</td></tr>
+                <tr><td>updated</td><td id="ts">${UPDATED_AT}</td></tr>
+              </table>
+
+              <div class="actions">
+                <a id="l" class="disabled" href="${PANEL_URL}">open panel -&gt;</a>
+                <button class="secondary" id="retry" onclick="checkTunnel()">cek ulang</button>
+              </div>
+            </main>
+
+            <script>
+              const fallback = "${PANEL_URL}";
+              const box = document.getElementById("box");
+              const badge = document.getElementById("badge");
+              const msg = document.getElementById("msg");
+              const st = document.getElementById("st");
+              const link = document.getElementById("l");
+              const ep = document.getElementById("ep");
+              const ts = document.getElementById("ts");
+              const chk = document.getElementById("tos-chk");
+
+              let activeTarget = fallback;
+              let isOnline = false;
+
+              if (localStorage.getItem("ptero_tos_ok") === "1") {
+                chk.checked = true;
+              }
+
+              function syncButton() {
+                if (chk.checked && isOnline) {
+                  link.classList.remove("disabled");
+                } else {
+                  link.classList.add("disabled");
+                }
+              }
+
+              chk.addEventListener("change", () => {
+                if (chk.checked) {
+                  localStorage.setItem("ptero_tos_ok", "1");
+                } else {
+                  localStorage.removeItem("ptero_tos_ok");
+                }
+                syncButton();
+              });
+
+              async function pingEndpoint(url) {
+                const ctrl = new AbortController();
+                const timer = setTimeout(() => ctrl.abort(), 6000);
+                try {
+                  await fetch(url + "/auth/login", { mode: "no-cors", cache: "no-store", signal: ctrl.signal });
+                  clearTimeout(timer);
+                  return true;
+                } catch (e) {
+                  clearTimeout(timer);
+                  return false;
+                }
+              }
+
+              async function checkTunnel() {
+                isOnline = false;
+                syncButton();
+                box.className = "";
+                badge.textContent = "checking tunnel...";
+                st.textContent = "pinging endpoint...";
+                msg.textContent = "memeriksa koneksi ke endpoint aktif...";
+
+                try {
+                  const r = await fetch("url.json?t=" + Date.now(), { cache: "no-store" });
+                  const d = await r.json();
+                  if (d.panel) activeTarget = d.panel;
+                  if (d.updated) ts.textContent = d.updated;
+                } catch (_) {}
+
+                link.href = activeTarget;
+                ep.textContent = activeTarget.replace(/^https?:\/\//, "");
+
+                const alive = await pingEndpoint(activeTarget);
+                if (alive) {
+                  isOnline = true;
+                  box.className = "online";
+                  badge.textContent = "tunnel active";
+                  st.textContent = "online (200 OK)";
+                  syncButton();
+                  if (chk.checked) {
+                    msg.textContent = "TOS disetujui, mengalihkan ke panel...";
+                    location.replace(activeTarget);
+                  } else {
+                    msg.textContent = "centang persetujuan TOS untuk membuka panel.";
+                  }
+                } else {
+                  box.className = "offline";
+                  badge.textContent = "tunnel unreachable";
+                  st.textContent = "offline / timeout";
+                  msg.textContent = "endpoint gagal dihubungi (auto-retry tiap 15 detik).";
+                }
+              }
+
+              checkTunnel();
+              setInterval(() => {
+                if (box.className === "offline") checkTunnel();
+              }, 15000);
+            </script>
+          </body>
+          </html>
           HTML
           cp index.html 404.html
-          printf '{"panel":"%s","updated":"%s"}\n' "$PANEL_URL" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > url.json
+          printf '{"panel":"%s","updated":"%s"}\n' "$PANEL_URL" "$UPDATED_AT" > url.json
           touch .nojekyll
           # custom domain GitHub Pages disimpan di file CNAME; harus ikut tiap push
           if [ -n "${PAGES_DOMAIN:-}" ]; then echo "$PAGES_DOMAIN" > CNAME; fi
@@ -546,6 +809,15 @@ jobs:
           sudo mkdir -p /etc/pterodactyl /var/lib/pterodactyl/volumes /tmp/pterodactyl
           sudo cp ../wings-config.yml /etc/pterodactyl/config.yml
 
+          # Batasi keras container server user max 400MB RAM & 2GB Disk di level Wings (anti DDoS/abuse)
+          python3 -c '
+          p = "/etc/pterodactyl/config.yml"
+          with open(p) as f: c = f.read()
+          if "container_limits:" not in c:
+              c += "\nsystem:\n  container_limits:\n    memory: 400\n    disk: 2048\n"
+          with open(p, "w") as f: f.write(c)
+          ' || true
+
       - name: Kunci jaringan container user (anti-abuse)
         run: |
           NET=172.18.0.0/16   # network Docker milik Wings (pterodactyl_nw)
@@ -562,6 +834,10 @@ jobs:
           sudo iptables -I DOCKER-USER -s "$NET" -m conntrack --ctstate NEW \
             -m hashlimit --hashlimit-name ptero_out --hashlimit-mode srcip \
             --hashlimit-above 60/sec --hashlimit-burst 120 -j DROP
+          # 5. batasi paket UDP keluar per container (anti UDP flood / DDoS)
+          sudo iptables -I DOCKER-USER -s "$NET" -p udp \
+            -m hashlimit --hashlimit-name ptero_udp --hashlimit-mode srcip \
+            --hashlimit-above 150/sec --hashlimit-burst 300 -j DROP
           sudo iptables -L DOCKER-USER -n --line-numbers
 
       - name: Install dan jalankan Wings
