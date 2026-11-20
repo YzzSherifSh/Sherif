@@ -1,4 +1,4 @@
-Name: Pterodactyl Boost
+name: Pterodactyl Boost
 
 on:
   workflow_dispatch:
