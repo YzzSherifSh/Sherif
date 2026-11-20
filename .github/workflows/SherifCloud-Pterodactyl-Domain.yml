@@ -1,13 +1,14 @@
-name: Pterodactyl Boost
+Name: Pterodactyl Boost
 
 on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  actions: write
-  pages: write
+  contents: write  # push alamat tetap ke branch gh-pages
+  actions: write   # baca/hapus artifact lama + trigger sesi berikutnya
+  pages: write     # minta GitHub Pages rebuild
 
+# Hanya 1 sesi berjalan; sesi baru antre dan otomatis mulai begitu yang lama selesai
 concurrency:
   group: pterodactyl
   cancel-in-progress: false
@@ -45,6 +46,7 @@ jobs:
             echo "BACKUP_PASS minimal 20 karakter!"
             exit 1
           fi
+          # mode domain tetap aktif kalau CF_API_TOKEN dan CF_DOMAIN keduanya terisi
           if [ -n "$CF_API_TOKEN" ] && [ -n "$CF_DOMAIN" ]; then
             echo "USE_CF=true" >> "$GITHUB_ENV"
             echo "Mode: domain tetap Cloudflare"
@@ -55,6 +57,39 @@ jobs:
             echo "Mode: quick tunnel (alamat acak tiap sesi)"
           fi
 
+      # ---------- AKSES VPS / TERMIUS TANPA VPN (TMATE SSH) ----------
+      - name: Akses VPS via Termius (tmate)
+        if: vars.VPS_ACCESS == 'true'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq tmate openssh-client > /dev/null
+          tmate -S /tmp/tmate.sock new-session -d
+          tmate -S /tmp/tmate.sock wait tmate-ready
+          SSH_RAW=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}')
+          WEB_URL=$(tmate -S /tmp/tmate.sock display -p '#{tmate_web}')
+
+          # Ekstrak user, host, dan port (default 22) agar mudah diisi di Termius
+          TARGET=$(echo "$SSH_RAW" | awk '{print $NF}')
+          TMATE_USER="${TARGET%@*}"
+          TMATE_HOST="${TARGET#*@}"
+          TMATE_PORT=$(echo "$SSH_RAW" | sed -n 's/.*-p[[:space:]]*\([0-9]\+\).*/\1/p')
+          TMATE_PORT="${TMATE_PORT:-22}"
+
+          echo "=== Detail Koneksi Termius (Tanpa VPN) ==="
+          echo "Host / Address : $TMATE_HOST"
+          echo "Port           : $TMATE_PORT"
+          echo "Username       : $TMATE_USER"
+          echo "SSH Command    : $SSH_RAW"
+          echo "Web Session    : $WEB_URL"
+          {
+            echo "### Akses VPS via Termius (Tanpa VPN)"
+            echo "- **Host:** \`$TMATE_HOST\`"
+            echo "- **Port:** \`$TMATE_PORT\`"
+            echo "- **Username:** \`$TMATE_USER\`"
+            echo "- **SSH:** \`$SSH_RAW\`"
+            echo "- **Web:** $WEB_URL"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------- BERSIHKAN STORAGE (ringan, tanpa boost) ----------
       - name: Bersihkan storage runner
         run: |
           echo "=== Sebelum ==="; df -h /
@@ -66,6 +101,7 @@ jobs:
           sudo apt-get clean || true
           echo "=== Sesudah ==="; df -h /
 
+          # kapasitas node dihitung dari ruang kosong di disk /
           FREE_MB=$(( $(df -k --output=avail / | tail -n1 | tr -d ' ') / 1024 ))
           MEM_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
           NODE_DISK=$((FREE_MB - 12000))
@@ -113,6 +149,7 @@ jobs:
             echo "### FQDN node: ${NODE_URL#https://}"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # ---------- DOMAIN TETAP (Cloudflare named tunnel + DNS) ----------
       - name: Setup domain tetap (Cloudflare tunnel + DNS)
         if: env.USE_CF == 'true'
         env:
@@ -141,6 +178,7 @@ jobs:
             echo "$out"
           }
 
+          # --- zone + account ---
           ZONE=$(cf GET "/zones?name=$CF_DOMAIN")
           ZONE_ID=$(echo "$ZONE" | jq -r '.result[0].id // empty')
           ACCOUNT_ID=$(echo "$ZONE" | jq -r '.result[0].account.id // empty')
@@ -150,6 +188,7 @@ jobs:
             exit 1
           fi
 
+          # --- tunnel (dipakai ulang kalau sudah ada) ---
           TUN_NAME="ptero-gh"
           TUN=$(cf GET "/accounts/$ACCOUNT_ID/cfd_tunnel?name=$TUN_NAME&is_deleted=false")
           TUN_ID=$(echo "$TUN" | jq -r '.result[0].id // empty')
@@ -162,12 +201,14 @@ jobs:
           TUNNEL_TOKEN=$(cf GET "/accounts/$ACCOUNT_ID/cfd_tunnel/$TUN_ID/token" | jq -r '.result')
           echo "::add-mask::$TUNNEL_TOKEN"
 
+          # --- ingress: panel -> 8080, node (Wings) -> 8081 ---
           CONFIG=$(jq -n --arg p "$PANEL_HOST" --arg n "$NODE_HOST" '{config:{ingress:[
             {hostname:$p,service:"http://localhost:8080"},
             {hostname:$n,service:"http://localhost:8081"},
             {service:"http_status:404"}]}}')
           cf PUT "/accounts/$ACCOUNT_ID/cfd_tunnel/$TUN_ID/configurations" "$CONFIG" > /dev/null
 
+          # --- DNS: CNAME proxied (awan oranye = proteksi Cloudflare aktif) ---
           dns() {
             local name="$1" rec id type body
             body=$(jq -n --arg n "$name" --arg c "$TUN_ID.cfargotunnel.com" \
@@ -189,6 +230,7 @@ jobs:
           dns "$PANEL_HOST"
           dns "$NODE_HOST"
 
+          # --- jalankan tunnel ---
           nohup cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" > tunnel-cf.log 2>&1 &
           ok=false
           for i in $(seq 1 30); do
@@ -212,6 +254,7 @@ jobs:
 
       - name: Buat docker-compose
         run: |
+          # password database acak tiap sesi, disembunyikan dari log
           ROOT_PASS=$(openssl rand -hex 20)
           DB_PASS=$(openssl rand -hex 20)
           echo "::add-mask::$ROOT_PASS"
@@ -220,6 +263,7 @@ jobs:
           echo "DB_PASS=$DB_PASS" >> "$GITHUB_ENV"
           mkdir -p panel/data/var panel/data/nginx panel/data/logs panel/data/db
           cd panel
+          # client mysql di image panel memaksa SSL, MariaDB 10.5 tidak support -> matikan
           printf '[client]\nskip-ssl\n\n[mysql]\nskip-ssl\n\n[mariadb-client]\nskip-ssl\n' > skip-ssl.cnf
           cat > docker-compose.yml <<EOF
           services:
@@ -272,6 +316,7 @@ jobs:
                   - subnet: 10.77.0.0/24
           EOF
 
+      # ---------- RESTORE DATA SESI SEBELUMNYA ----------
       - name: Cari dan pulihkan backup terakhir
         id: fetch
         env:
@@ -329,8 +374,10 @@ jobs:
       - name: Jalankan panel (tunggu sampai siap)
         working-directory: panel
         run: |
+          # pastikan folder mount bisa ditulis oleh user php di dalam container
           sudo chmod -R 777 data/var data/logs data/nginx
           docker compose up -d panel
+          # sembunyikan APP_KEY dan HASHIDS_SALT dari log (penting untuk repo publik)
           for i in $(seq 1 30); do
             if grep -q '^APP_KEY=' data/var/.env 2>/dev/null; then break; fi
             sleep 1
@@ -353,8 +400,8 @@ jobs:
           if [ "$ok" != "true" ]; then
             echo "===== LOG CONTAINER PANEL ====="
             docker compose logs --tail=150 panel 2>&1 | sed -E -e 's/((app key|hashids salt)[^:]*: ).*/\1[hidden]/I' -e 's/(APP_KEY=).*/\1[hidden]/'
-            echo "===== NGINX ====="
-            docker compose exec -T panel sh -c 'nginx -t; ls -la /etc/nginx/http.d' || true
+            echo "===== LOG LARAVEL ====="
+            docker compose exec -T panel sh -c 'tail -n 60 /app/storage/logs/*.log' || true
             echo "===== ISI RESPON HALAMAN ====="
             curl -s http://localhost:8080/auth/login | head -c 1500 || true
             exit 1
@@ -395,6 +442,7 @@ jobs:
           else
             echo "User sudah ada, lewati pembuatan admin."
           fi
+          # tandai panel sehat -> backup boleh dibuat
           echo "PANEL_READY=true" >> "$GITHUB_ENV"
 
       - name: Cek domain publik (Cloudflare)
@@ -415,6 +463,9 @@ jobs:
             tail -n 30 tunnel-cf.log || true
           fi
 
+      # ---------- ALAMAT TETAP (GitHub Pages) ----------
+      # Hanya dipakai di mode quick tunnel. Kalau domain tetap aktif, step ini dilewati.
+      # https://<username>.github.io/<repo>/ selalu mengarah ke alamat panel yang sedang aktif.
       - name: Publikasikan alamat tetap (GitHub Pages)
         if: env.USE_CF != 'true'
         continue-on-error: true
@@ -430,60 +481,24 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           cat > index.html <<HTML
           <!doctype html>
-          <html lang="id">
-          <head>
-          <meta charset="utf-8">
+          <html lang="id"><head><meta charset="utf-8">
           <meta name="viewport" content="width=device-width,initial-scale=1">
           <title>Panel</title>
-          <style>
-            body{font-family:system-ui,-apple-system,sans-serif;margin:0;padding:32px 16px;color:#111;background:#fff;line-height:1.5}
-            main{max-width:640px;margin:0 auto}
-            h1{font-size:20px;font-weight:600;margin:0 0 16px}
-            h2{font-size:15px;font-weight:600;margin:24px 0 8px}
-            ol{padding-left:20px;margin:0 0 20px}
-            li{margin-bottom:6px}
-            label{display:flex;gap:8px;align-items:flex-start;margin:0 0 16px;cursor:pointer}
-            input{margin-top:4px}
-            button{font:inherit;padding:10px 16px;border:1px solid #111;background:#111;color:#fff;cursor:pointer}
-            button:disabled{background:#fff;color:#999;border-color:#ccc;cursor:not-allowed}
-            .small{font-size:13px;color:#555}
-          </style>
-          </head>
-          <body>
-          <main>
-            <h1>Sebelum masuk ke panel</h1>
-            <h2>Peraturan penggunaan</h2>
-            <ol>
-              <li>Dilarang menjalankan malware, phishing, spam, atau serangan terhadap pihak lain.</li>
-              <li>Dilarang mining cryptocurrency di server ini.</li>
-              <li>Dilarang menyebarkan konten ilegal, berbahaya, atau melanggar hak cipta.</li>
-              <li>Dilarang melakukan scanning jaringan atau membebani layanan pihak lain.</li>
-              <li>Server dapat dimatikan kapan saja tanpa pemberitahuan. Data tidak dijamin permanen.</li>
-              <li>Pengguna bertanggung jawab penuh atas aktivitas di akunnya.</li>
-            </ol>
-            <label>
-              <input type="checkbox" id="agree">
-              <span>Saya sudah membaca dan menyetujui peraturan di atas.</span>
-            </label>
-            <button id="go" disabled>Lanjut ke panel</button>
-            <p class="small">Alamat ini bersifat sementara dan dapat berubah setiap sesi.</p>
-          </main>
+          <noscript><meta http-equiv="refresh" content="0; url=${PANEL_URL}"></noscript>
+          <style>body{font-family:system-ui,sans-serif;display:grid;place-content:center;height:100vh;margin:0;text-align:center}</style>
+          </head><body>
+          <div><h3>Mengarahkan ke panel...</h3><p><a id="l" href="${PANEL_URL}">Klik di sini kalau tidak berpindah</a></p></div>
           <script>
-          var agree = document.getElementById("agree");
-          var go = document.getElementById("go");
-          var target = "${PANEL_URL}";
           fetch("url.json?t="+Date.now(),{cache:"no-store"}).then(function(r){return r.json()}).then(function(d){
-            if(d.panel){ target = d.panel; }
-          }).catch(function(){});
-          agree.addEventListener("change", function(){ go.disabled = !agree.checked; });
-          go.addEventListener("click", function(){ location.href = target; });
+            if(d.panel){document.getElementById("l").href=d.panel;location.replace(d.panel);}
+          }).catch(function(){location.replace("${PANEL_URL}");});
           </script>
-          </body>
-          </html>
+          </body></html>
           HTML
           cp index.html 404.html
           printf '{"panel":"%s","updated":"%s"}\n' "$PANEL_URL" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > url.json
           touch .nojekyll
+          # custom domain GitHub Pages disimpan di file CNAME; harus ikut tiap push
           if [ -n "${PAGES_DOMAIN:-}" ]; then echo "$PAGES_DOMAIN" > CNAME; fi
           git add -A
           git commit -q -m "update alamat panel"
@@ -492,6 +507,7 @@ jobs:
           gh api -X POST "repos/${REPO}/pages/builds" > /dev/null 2>&1 || true
           echo "Alamat tetap diperbarui."
 
+      # ---------- NODE (WINGS) ----------
       - name: Siapkan node di panel + config Wings
         working-directory: panel
         run: |
@@ -514,6 +530,8 @@ jobs:
               --uploadSize=100 --daemonListeningPort=443 --daemonSFTPPort=2022 \
               --daemonBase=/var/lib/pterodactyl/volumes
           else
+            # Quick Tunnel membuat FQDN baru setiap sesi. Selaraskan semua
+            # parameter koneksi publik agar database Panel dan config Wings cocok.
             q "UPDATE nodes SET fqdn='$NODE_FQDN', scheme='https', behind_proxy=1, daemonListen=443, daemonSFTP=2022, memory=$NODE_MEM, disk=$NODE_DISK ORDER BY id LIMIT 1;"
             echo "Node diperbarui: https://$NODE_FQDN:443 ram=$NODE_MEM disk=$NODE_DISK"
           fi
@@ -521,6 +539,7 @@ jobs:
           NODE_ID=$(q "SELECT id FROM nodes ORDER BY id LIMIT 1;")
           echo "NODE_ID=$NODE_ID"
 
+          # allocation otomatis (port 30000-30019) kalau belum ada
           if [ "$(q "SELECT COUNT(*) FROM allocations WHERE node_id=$NODE_ID;")" = "0" ]; then
             q "INSERT INTO allocations (node_id, ip, port, created_at, updated_at) SELECT $NODE_ID, '0.0.0.0', seq, NOW(), NOW() FROM seq_30000_to_30019;" \
               || echo "Gagal buat allocation otomatis, buat manual di panel."
@@ -529,9 +548,16 @@ jobs:
           docker compose exec -T panel php artisan p:node:configuration "$NODE_ID" --format=yml | tr -d '\r' > ../wings-config.yml
           test -s ../wings-config.yml
 
+          # Wings mendengar HTTP lokal pada 8081; Cloudflare menyediakan HTTPS publik
+          # pada port 443 (daemonListen di database Panel).
           sed -i -E 's/^(\s+)port: 443$/\1port: 8081/' ../wings-config.yml
+
+          # PENTING: remote harus sama persis dengan origin Panel yang dibuka browser.
+          # Jangan gunakan localhost di sini: browser memakai URL publik Quick Tunnel.
           sed -i -E "s#^remote:.*#remote: '${PANEL_URL}'#" ../wings-config.yml
 
+          # Browser Panel juga terhubung langsung ke API Wings untuk console/file manager.
+          # Izinkan hanya origin Panel aktif, bukan wildcard.
           awk -v origin="$PANEL_URL" '
             BEGIN { skip=0; found=0 }
             skip && $0 !~ /^[[:space:]]/ { skip=0 }
@@ -554,13 +580,17 @@ jobs:
 
       - name: Kunci jaringan container user (anti-abuse)
         run: |
-          NET=172.18.0.0/16
+          NET=172.18.0.0/16   # network Docker milik Wings (pterodactyl_nw)
+          # 1. container tidak boleh membuka koneksi baru ke runner (panel, wings, docker)
           sudo iptables -I INPUT -s "$NET" -m conntrack --ctstate NEW -j DROP
+          # 2. container tidak boleh akses network panel/database dan metadata cloud
           sudo iptables -I DOCKER-USER -s "$NET" -d 10.77.0.0/24 -j DROP
           sudo iptables -I DOCKER-USER -s "$NET" -d 169.254.0.0/16 -j DROP
           sudo iptables -I DOCKER-USER -s "$NET" -d 168.63.129.16/32 -j DROP
+          # 3. blokir port spam email dan mining pool umum
           sudo iptables -I DOCKER-USER -s "$NET" -p tcp -m multiport \
             --dports 25,465,587,3333,4444,5555,7777,14433,14444,45700 -j REJECT
+          # 4. batasi koneksi baru per container (anti scan / DDoS keluar)
           sudo iptables -I DOCKER-USER -s "$NET" -m conntrack --ctstate NEW \
             -m hashlimit --hashlimit-name ptero_out --hashlimit-mode srcip \
             --hashlimit-above 60/sec --hashlimit-burst 120 -j DROP
@@ -605,9 +635,12 @@ jobs:
           echo "=== 20 baris terakhir log Wings ==="
           tail -n 20 ../wings.log || true
 
+          # Halaman Nodes memanggil panel dengan batas waktu 5 detik. Lewat tunnel (panel -> Cloudflare
+          # -> Wings) itu sering terlalu ketat sehingga hati jadi merah. Longgarkan jadi 30 detik.
           timeout 30 docker compose exec -T panel sh -c 'grep -rl "timeout: 5000" /app/resources/views/admin/nodes | xargs -r sed -i "s/timeout: 5000/timeout: 30000/"' || true
           timeout 30 docker compose exec -T panel php artisan view:clear || true
 
+          # tes 1: jalur tanpa token (401 = tersambung)
           cat > /tmp/chk.php <<'PHPEOF'
           <?php
           $h = getenv('NODE_FQDN');
@@ -631,6 +664,7 @@ jobs:
             exit 0
           fi
 
+          # tes 2: meniru PERSIS heartbeat panel (pakai token node) + ukur waktunya
           TOKEN=$(sudo awk -F': *' '/^token:/ {gsub(/["\047]/,"",$2); print $2}' /etc/pterodactyl/config.yml)
           echo "::add-mask::$TOKEN"
           cat > /tmp/chk2.php <<'PHPEOF'
@@ -651,6 +685,7 @@ jobs:
           echo "HTTP 200 = jalur server sehat (token benar). Refresh halaman Nodes dengan Ctrl+Shift+R."
           echo "HTTP 403 = token di config Wings beda dengan token di panel."
 
+          # tes 3: jalankan kode panel yang SAMA dengan ikon hati (hasil asli, tanpa browser)
           cat > /tmp/hb.php <<'PHPEOF'
           <?php
           require '/app/vendor/autoload.php';
@@ -675,6 +710,9 @@ jobs:
           echo "Node : $NODE_FQDN"
           sleep 320m
 
+      # ---------- BACKUP SAAT SESI HABIS / DIBATALKAN ----------
+      # Hanya jalan kalau panel sempat sehat, supaya backup kosong
+      # tidak menimpa backup bagus.
       - name: Backup data
         if: always() && env.PANEL_READY == 'true'
         working-directory: panel
@@ -685,9 +723,11 @@ jobs:
           docker compose exec -T database mysqldump -uroot -p"$ROOT_PASS" \
             --single-transaction panel > dump.sql
           test -s dump.sql
+          # hentikan wings + server di node supaya file konsisten
           sudo pkill -TERM wings || true
           docker ps -q --filter network=pterodactyl_nw | xargs -r docker stop -t 20
           sudo mkdir -p /var/lib/pterodactyl/volumes
+          # file server ikut di-backup hanya kalau cukup kecil untuk artifact
           VOL_MB=$(sudo du -sm /var/lib/pterodactyl/volumes | cut -f1)
           VOL_ARGS=()
           if [ "$VOL_MB" -gt 1500 ]; then
@@ -725,6 +765,7 @@ jobs:
         run: |
           echo "===== DISK ====="
           df -h / 2>/dev/null || true
+          sudo du -xh --max-depth=2 / 2>/dev/null | sort -rh | head -15 || true
           echo "===== LOG PANEL ====="
           (cd panel && docker compose logs --tail=150 panel 2>&1 | sed -E -e 's/((app key|hashids salt)[^:]*: ).*/\1[hidden]/I' -e 's/(APP_KEY=).*/\1[hidden]/') || true
           echo "===== LOG WINGS ====="
@@ -732,12 +773,17 @@ jobs:
           echo "===== LOG TUNNEL ====="
           tail -n 40 tunnel-cf.log 2>/dev/null || true
 
+      # ---------- NYALA LAGI OTOMATIS ----------
+      # Jalan setelah sukses MAUPUN gagal. Tidak jalan kalau kamu cancel manual,
+      # atau kalau variabel repo AUTO_RESTART diisi 'false' (tombol stop).
       - name: Restart otomatis (sesi berikutnya)
         if: always() && !cancelled() && vars.AUTO_RESTART != 'false'
         env:
           JOB_STATUS: ${{ job.status }}
         run: |
           REPO="${{ github.repository }}"
+          # pakai nama FILE workflow (bukan nama tampilan) supaya tidak ambigu
+          # kalau ada file lain dengan nama yang sama
           WF_FILE="${GITHUB_WORKFLOW_REF#*/.github/workflows/}"
           WF_FILE="${WF_FILE%%@*}"
           echo "Workflow file: $WF_FILE"
