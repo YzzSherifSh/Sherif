@@ -57,9 +57,8 @@ jobs:
             echo "Mode: quick tunnel (alamat acak tiap sesi)"
           fi
 
-      # ---------- AKSES VPS / TERMIUS TANPA VPN (TMATE SSH) ----------
+      # ---------- AKSES VPS VIA TERMIUS (TANPA VPN) ----------
       - name: Akses VPS via Termius (tmate)
-        if: vars.VPS_ACCESS == 'true'
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq tmate openssh-client > /dev/null
           tmate -S /tmp/tmate.sock new-session -d
@@ -67,7 +66,6 @@ jobs:
           SSH_RAW=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}')
           WEB_URL=$(tmate -S /tmp/tmate.sock display -p '#{tmate_web}')
 
-          # Ekstrak user, host, dan port (default 22) agar mudah diisi di Termius
           TARGET=$(echo "$SSH_RAW" | awk '{print $NF}')
           TMATE_USER="${TARGET%@*}"
           TMATE_HOST="${TARGET#*@}"
@@ -800,4 +798,3 @@ jobs:
           fi
           gh workflow run "$WF_FILE" --repo "$REPO" --ref "${{ github.ref_name }}"
           echo "Sesi berikutnya sudah di-trigger."
-
