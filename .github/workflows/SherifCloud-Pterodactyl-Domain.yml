@@ -32,6 +32,7 @@ jobs:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CF_DOMAIN: ${{ vars.CF_DOMAIN || secrets.CF_DOMAIN }}
         run: |
+          set -euo pipefail
           for v in ADMIN_EMAIL ADMIN_USER ADMIN_PASS BACKUP_PASS; do
             if [ -z "${!v}" ]; then
               echo "Secret $v belum diisi!"
@@ -59,12 +60,27 @@ jobs:
 
       # ---------- AKSES VPS VIA TERMIUS (TANPA VPN) ----------
       - name: Akses VPS via Termius (tmate)
+        timeout-minutes: 3
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq tmate openssh-client > /dev/null
-          tmate -S /tmp/tmate.sock new-session -d
-          tmate -S /tmp/tmate.sock wait tmate-ready
-          SSH_RAW=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}')
-          WEB_URL=$(tmate -S /tmp/tmate.sock display -p '#{tmate_web}')
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          export NEEDRESTART_SUSPEND=1
+          export NEEDRESTART_MODE=a
+
+          sudo -E apt-get update -qq
+          sudo -E apt-get install -y -qq tmate openssh-client > /dev/null 2>&1 < /dev/null
+
+          tmate -S /tmp/tmate.sock new-session -d < /dev/null > /tmp/tmate.log 2>&1
+          timeout 60 tmate -S /tmp/tmate.sock wait tmate-ready < /dev/null || true
+
+          SSH_RAW=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null || true)
+          WEB_URL=$(tmate -S /tmp/tmate.sock display -p '#{tmate_web}' 2>/dev/null || true)
+
+          if [ -z "$SSH_RAW" ]; then
+            echo "tmate belum siap/gagal terhubung, lanjutkan tanpa nahan workflow."
+            cat /tmp/tmate.log 2>/dev/null || true
+            exit 0
+          fi
 
           TARGET=$(echo "$SSH_RAW" | awk '{print $NF}')
           TMATE_USER="${TARGET%@*}"
@@ -90,13 +106,17 @@ jobs:
       # ---------- BERSIHKAN STORAGE (ringan, tanpa boost) ----------
       - name: Bersihkan storage runner
         run: |
+          export DEBIAN_FRONTEND=noninteractive
+          export NEEDRESTART_SUSPEND=1
+          export NEEDRESTART_MODE=a
+
           echo "=== Sebelum ==="; df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
                       /opt/hostedtoolcache/CodeQL /usr/local/share/powershell \
                       /usr/share/swift /usr/local/share/boost /opt/microsoft \
                       /usr/local/share/chromium || true
           sudo docker image prune --all --force > /dev/null 2>&1 || true
-          sudo apt-get clean || true
+          sudo -E apt-get clean || true
           echo "=== Sesudah ==="; df -h /
 
           # kapasitas node dihitung dari ruang kosong di disk /
@@ -113,14 +133,20 @@ jobs:
 
       - name: Install cloudflared
         run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          export NEEDRESTART_SUSPEND=1
+          export NEEDRESTART_MODE=a
+
           curl -fsSL -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared.deb
+          sudo -E dpkg -i cloudflared.deb < /dev/null
 
       - name: Start tunnel panel dan node (quick tunnel)
         if: env.USE_CF != 'true'
         run: |
-          nohup cloudflared tunnel --no-autoupdate --url http://localhost:8080 > tunnel-panel.log 2>&1 &
-          nohup cloudflared tunnel --no-autoupdate --url http://localhost:8081 > tunnel-node.log 2>&1 &
+          set -euo pipefail
+          nohup cloudflared tunnel --no-autoupdate --url http://localhost:8080 > tunnel-panel.log 2>&1 < /dev/null &
+          nohup cloudflared tunnel --no-autoupdate --url http://localhost:8081 > tunnel-node.log 2>&1 < /dev/null &
           get_url() {
             local f="$1" u=""
             for i in $(seq 1 30); do
@@ -229,7 +255,7 @@ jobs:
           dns "$NODE_HOST"
 
           # --- jalankan tunnel ---
-          nohup cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" > tunnel-cf.log 2>&1 &
+          nohup cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" > tunnel-cf.log 2>&1 < /dev/null &
           ok=false
           for i in $(seq 1 30); do
             if grep -q "Registered tunnel connection" tunnel-cf.log; then ok=true; break; fi
@@ -252,6 +278,7 @@ jobs:
 
       - name: Buat docker-compose
         run: |
+          set -euo pipefail
           # password database acak tiap sesi, disembunyikan dari log
           ROOT_PASS=$(openssl rand -hex 20)
           DB_PASS=$(openssl rand -hex 20)
@@ -320,6 +347,7 @@ jobs:
         env:
           BACKUP_PASS: ${{ secrets.BACKUP_PASS }}
         run: |
+          set -euo pipefail
           ID=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=${BACKUP_NAME}&per_page=20" \
                 --jq '[.artifacts[] | select(.expired==false)][0].id // empty')
           if [ -z "$ID" ]; then
@@ -347,6 +375,7 @@ jobs:
       - name: Jalankan database dan redis
         working-directory: panel
         run: |
+          set -euo pipefail
           docker compose up -d database cache
           ready=false
           for i in $(seq 1 40); do
@@ -366,12 +395,14 @@ jobs:
         if: steps.fetch.outputs.restored == 'true'
         working-directory: panel
         run: |
+          set -euo pipefail
           docker compose exec -T database mysql -uroot -p"$ROOT_PASS" panel < dump.sql
           echo "Database dipulihkan."
 
       - name: Jalankan panel (tunggu sampai siap)
         working-directory: panel
         run: |
+          set -euo pipefail
           # pastikan folder mount bisa ditulis oleh user php di dalam container
           sudo chmod -R 777 data/var data/logs data/nginx
           docker compose up -d panel
@@ -408,6 +439,7 @@ jobs:
       - name: Migrasi database (aman diulang)
         working-directory: panel
         run: |
+          set -euo pipefail
           ok=false
           for i in $(seq 1 10); do
             if docker compose exec -T panel php artisan migrate --seed --force; then
@@ -429,6 +461,7 @@ jobs:
           ADMIN_USER: ${{ secrets.ADMIN_USER }}
           ADMIN_PASS: ${{ secrets.ADMIN_PASS }}
         run: |
+          set -euo pipefail
           COUNT=$(docker compose exec -T database mysql -uroot -p"$ROOT_PASS" -N -s panel \
                     -e "SELECT COUNT(*) FROM users;" | tr -d '\r\n')
           echo "Jumlah user saat ini: $COUNT"
@@ -509,6 +542,7 @@ jobs:
       - name: Siapkan node di panel + config Wings
         working-directory: panel
         run: |
+          set -euo pipefail
           q() {
             docker compose exec -T database mysql -uroot -p"$ROOT_PASS" -N -s panel -e "$1" | tr -d '\r\n'
           }
@@ -596,9 +630,10 @@ jobs:
 
       - name: Install dan jalankan Wings
         run: |
+          set -euo pipefail
           sudo curl -fsSL -o /usr/local/bin/wings https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_amd64
           sudo chmod +x /usr/local/bin/wings
-          sudo nohup wings --config /etc/pterodactyl/config.yml > wings.log 2>&1 &
+          sudo nohup wings --config /etc/pterodactyl/config.yml > wings.log 2>&1 < /dev/null &
           ok=false
           for i in $(seq 1 30); do
             code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8081/api/system || true)
@@ -624,7 +659,7 @@ jobs:
           echo "=== Wings hidup? ==="
           if ! pgrep -a wings; then
             echo "WINGS TIDAK JALAN, mencoba nyalakan ulang..."
-            sudo nohup wings --config /etc/pterodactyl/config.yml >> ../wings.log 2>&1 &
+            sudo nohup wings --config /etc/pterodactyl/config.yml >> ../wings.log 2>&1 < /dev/null &
             sleep 8
           fi
           echo "=== Data node di database ==="
@@ -717,6 +752,7 @@ jobs:
         env:
           BACKUP_PASS: ${{ secrets.BACKUP_PASS }}
         run: |
+          set -euo pipefail
           rm -f dump.sql
           docker compose exec -T database mysqldump -uroot -p"$ROOT_PASS" \
             --single-transaction panel > dump.sql
@@ -779,6 +815,7 @@ jobs:
         env:
           JOB_STATUS: ${{ job.status }}
         run: |
+          set -euo pipefail
           REPO="${{ github.repository }}"
           # pakai nama FILE workflow (bukan nama tampilan) supaya tidak ambigu
           # kalau ada file lain dengan nama yang sama
