@@ -2,6 +2,16 @@ name: Pterodactyl Boost
 
 on:
   workflow_dispatch:
+    inputs:
+      os:
+        description: "Pilih profil OS (ubuntu / debian / alpine)"
+        required: false
+        default: "ubuntu"
+        type: choice
+        options:
+          - ubuntu
+          - debian
+          - alpine
 
 permissions:
   contents: write  # push alamat tetap ke branch gh-pages
@@ -23,6 +33,39 @@ jobs:
     timeout-minutes: 355
 
     steps:
+      - name: Info OS & Versi
+        run: |
+          set -euo pipefail
+          SELECTED_OS="${{ inputs.os || vars.RUNNER_OS || 'ubuntu' }}"
+          echo "SELECTED_OS=$SELECTED_OS" >> "$GITHUB_ENV"
+
+          OS_PRETTY=$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-Linux}" || uname -s)
+          OS_NAME=$(. /etc/os-release 2>/dev/null && echo "${NAME:-Linux}" || uname -s)
+          OS_VERSION=$(. /etc/os-release 2>/dev/null && echo "${VERSION:-unknown}" || uname -r)
+          OS_VERSION_ID=$(. /etc/os-release 2>/dev/null && echo "${VERSION_ID:-unknown}" || uname -r)
+          KERNEL_REL=$(uname -r)
+          ARCH_NAME=$(uname -m)
+
+          echo "=== Informasi OS & Versi ==="
+          echo "Profil dipilih : $SELECTED_OS"
+          echo "OS Pretty      : $OS_PRETTY"
+          echo "OS Name        : $OS_NAME"
+          echo "OS Version     : $OS_VERSION"
+          echo "OS Version ID  : $OS_VERSION_ID"
+          echo "Kernel         : $KERNEL_REL"
+          echo "Arsitektur     : $ARCH_NAME"
+          if command -v lsb_release >/dev/null 2>&1; then
+            lsb_release -d -r -c || true
+          fi
+          {
+            echo "### Informasi OS & Versi"
+            echo "- **Profil Dipilih:** \`$SELECTED_OS\`"
+            echo "- **OS:** \`$OS_PRETTY\`"
+            echo "- **Versi:** \`$OS_VERSION\` (ID: \`$OS_VERSION_ID\`)"
+            echo "- **Kernel:** \`$KERNEL_REL\`"
+            echo "- **Arsitektur:** \`$ARCH_NAME\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Cek secret
         env:
           ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
@@ -31,6 +74,7 @@ jobs:
           BACKUP_PASS: ${{ secrets.BACKUP_PASS }}
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CF_DOMAIN: ${{ vars.CF_DOMAIN || secrets.CF_DOMAIN }}
+          SSH_PASS: ${{ secrets.SSH_PASS }}
         run: |
           set -euo pipefail
           for v in ADMIN_EMAIL ADMIN_USER ADMIN_PASS BACKUP_PASS; do
@@ -47,6 +91,12 @@ jobs:
             echo "BACKUP_PASS minimal 20 karakter!"
             exit 1
           fi
+          if [ -n "$SSH_PASS" ]; then
+            echo "ENABLE_SSH_TUNNEL=true" >> "$GITHUB_ENV"
+            echo "SSH Tunnel: AKTIF (secret SSH_PASS terdeteksi)"
+          else
+            echo "SSH Tunnel: NONAKTIF (tambahkan secret SSH_PASS untuk mengaktifkan SSH)"
+          fi
           # mode domain tetap aktif kalau CF_API_TOKEN dan CF_DOMAIN keduanya terisi
           if [ -n "$CF_API_TOKEN" ] && [ -n "$CF_DOMAIN" ]; then
             echo "USE_CF=true" >> "$GITHUB_ENV"
@@ -56,47 +106,6 @@ jobs:
             exit 1
           else
             echo "Mode: quick tunnel (alamat acak tiap sesi)"
-          fi
-
-      # ---------- AKSES VPS VIA TERMIUS (TANPA VPN) ----------
-      - name: Akses VPS via Termius (tmate)
-        timeout-minutes: 3
-        run: |
-          set -euo pipefail
-          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=a apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=a apt-get install -y -qq tmate openssh-client > /dev/null 2>&1 < /dev/null
-
-          tmate -S /tmp/tmate.sock new-session -d < /dev/null > /tmp/tmate.log 2>&1 || true
-          timeout 30 tmate -S /tmp/tmate.sock wait tmate-ready < /dev/null || true
-
-          SSH_RAW=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null || true)
-          WEB_URL=$(tmate -S /tmp/tmate.sock display -p '#{tmate_web}' 2>/dev/null || true)
-
-          if [ -n "$SSH_RAW" ]; then
-            TARGET=$(echo "$SSH_RAW" | awk '{print $NF}')
-            TMATE_USER="${TARGET%@*}"
-            TMATE_HOST="${TARGET#*@}"
-            TMATE_PORT=$(echo "$SSH_RAW" | sed -n 's/.*-p[[:space:]]*\([0-9]\+\).*/\1/p')
-            TMATE_PORT="${TMATE_PORT:-22}"
-
-            echo "=== Detail Koneksi Termius (Tanpa VPN) ==="
-            echo "Host / Address : $TMATE_HOST"
-            echo "Port           : $TMATE_PORT"
-            echo "Username       : $TMATE_USER"
-            echo "SSH Command    : $SSH_RAW"
-            echo "Web Session    : $WEB_URL"
-            {
-              echo "### Akses VPS via Termius (Tanpa VPN)"
-              echo "- **Host:** \`$TMATE_HOST\`"
-              echo "- **Port:** \`$TMATE_PORT\`"
-              echo "- **Username:** \`$TMATE_USER\`"
-              echo "- **SSH:** \`$SSH_RAW\`"
-              echo "- **Web:** $WEB_URL"
-            } >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "tmate tidak bisa terhubung ke server tmate.io (kemungkinan diblokir jaringan runner)."
-            cat /tmp/tmate.log 2>/dev/null || true
-            echo "Melanjutkan workflow tanpa nahan proses..."
           fi
 
       # ---------- BERSIHKAN STORAGE (ringan, tanpa boost) ----------
@@ -136,6 +145,44 @@ jobs:
 
           curl -fsSL -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=a dpkg -i cloudflared.deb < /dev/null
+
+      # ---------- SSH VIA TUNNEL (TANPA VPN) ----------
+      - name: Setup SSH + Tunnel VPS
+        if: env.ENABLE_SSH_TUNNEL == 'true'
+        env:
+          SSH_USER: ${{ secrets.SSH_USER || 'runner' }}
+          SSH_PASS: ${{ secrets.SSH_PASS }}
+        run: |
+          set -euo pipefail
+          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=a apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=a apt-get install -y -qq openssh-server > /dev/null 2>&1 < /dev/null
+
+          if ! id "$SSH_USER" >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash "$SSH_USER"
+            echo "$SSH_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee "/etc/sudoers.d/$SSH_USER" >/dev/null
+          fi
+          echo "$SSH_USER:$SSH_PASS" | sudo chpasswd
+
+          sudo mkdir -p /run/sshd
+          sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+          sudo /usr/sbin/sshd
+
+          nohup cloudflared tunnel --no-autoupdate --url tcp://localhost:22 > tunnel-ssh.log 2>&1 < /dev/null &
+          SSH_URL=""
+          for i in $(seq 1 30); do
+            SSH_URL=$(grep -oE 'https://[-a-z0-9]*\.trycloudflare\.com|tcp://[^[:space:]]+' tunnel-ssh.log | head -n1 || true)
+            [ -n "$SSH_URL" ] && break
+            sleep 2
+          done
+          echo "=== Akses SSH via Tunnel ==="
+          echo "User     : $SSH_USER"
+          echo "Endpoint : ${SSH_URL:-cek tunnel-ssh.log}"
+          {
+            echo "### SSH via Tunnel"
+            echo "- **User:** \`$SSH_USER\`"
+            echo "- **Endpoint:** \`${SSH_URL:-cek tunnel-ssh.log}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Start tunnel panel dan node (quick tunnel)
         if: env.USE_CF != 'true'
@@ -735,8 +782,9 @@ jobs:
       - name: Panel dan node aktif
         run: |
           echo "=== Pemakaian disk ==="; df -h /
-          echo "Panel: $PANEL_URL"
-          echo "Node : $NODE_FQDN"
+          echo "Profil OS : $SELECTED_OS"
+          echo "Panel     : $PANEL_URL"
+          echo "Node      : $NODE_FQDN"
           sleep 320m
 
       # ---------- BACKUP SAAT SESI HABIS / DIBATALKAN ----------
