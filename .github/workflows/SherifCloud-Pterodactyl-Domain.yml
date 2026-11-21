@@ -63,45 +63,41 @@ jobs:
         timeout-minutes: 3
         run: |
           set -euo pipefail
-          export DEBIAN_FRONTEND=noninteractive
-          export NEEDRESTART_SUSPEND=1
-          export NEEDRESTART_MODE=a
+          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=a apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=a apt-get install -y -qq tmate openssh-client > /dev/null 2>&1 < /dev/null
 
-          sudo -E apt-get update -qq
-          sudo -E apt-get install -y -qq tmate openssh-client > /dev/null 2>&1 < /dev/null
-
-          tmate -S /tmp/tmate.sock new-session -d < /dev/null > /tmp/tmate.log 2>&1
-          timeout 60 tmate -S /tmp/tmate.sock wait tmate-ready < /dev/null || true
+          tmate -S /tmp/tmate.sock new-session -d < /dev/null > /tmp/tmate.log 2>&1 || true
+          timeout 30 tmate -S /tmp/tmate.sock wait tmate-ready < /dev/null || true
 
           SSH_RAW=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null || true)
           WEB_URL=$(tmate -S /tmp/tmate.sock display -p '#{tmate_web}' 2>/dev/null || true)
 
-          if [ -z "$SSH_RAW" ]; then
-            echo "tmate belum siap/gagal terhubung, lanjutkan tanpa nahan workflow."
+          if [ -n "$SSH_RAW" ]; then
+            TARGET=$(echo "$SSH_RAW" | awk '{print $NF}')
+            TMATE_USER="${TARGET%@*}"
+            TMATE_HOST="${TARGET#*@}"
+            TMATE_PORT=$(echo "$SSH_RAW" | sed -n 's/.*-p[[:space:]]*\([0-9]\+\).*/\1/p')
+            TMATE_PORT="${TMATE_PORT:-22}"
+
+            echo "=== Detail Koneksi Termius (Tanpa VPN) ==="
+            echo "Host / Address : $TMATE_HOST"
+            echo "Port           : $TMATE_PORT"
+            echo "Username       : $TMATE_USER"
+            echo "SSH Command    : $SSH_RAW"
+            echo "Web Session    : $WEB_URL"
+            {
+              echo "### Akses VPS via Termius (Tanpa VPN)"
+              echo "- **Host:** \`$TMATE_HOST\`"
+              echo "- **Port:** \`$TMATE_PORT\`"
+              echo "- **Username:** \`$TMATE_USER\`"
+              echo "- **SSH:** \`$SSH_RAW\`"
+              echo "- **Web:** $WEB_URL"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "tmate tidak bisa terhubung ke server tmate.io (kemungkinan diblokir jaringan runner)."
             cat /tmp/tmate.log 2>/dev/null || true
-            exit 0
+            echo "Melanjutkan workflow tanpa nahan proses..."
           fi
-
-          TARGET=$(echo "$SSH_RAW" | awk '{print $NF}')
-          TMATE_USER="${TARGET%@*}"
-          TMATE_HOST="${TARGET#*@}"
-          TMATE_PORT=$(echo "$SSH_RAW" | sed -n 's/.*-p[[:space:]]*\([0-9]\+\).*/\1/p')
-          TMATE_PORT="${TMATE_PORT:-22}"
-
-          echo "=== Detail Koneksi Termius (Tanpa VPN) ==="
-          echo "Host / Address : $TMATE_HOST"
-          echo "Port           : $TMATE_PORT"
-          echo "Username       : $TMATE_USER"
-          echo "SSH Command    : $SSH_RAW"
-          echo "Web Session    : $WEB_URL"
-          {
-            echo "### Akses VPS via Termius (Tanpa VPN)"
-            echo "- **Host:** \`$TMATE_HOST\`"
-            echo "- **Port:** \`$TMATE_PORT\`"
-            echo "- **Username:** \`$TMATE_USER\`"
-            echo "- **SSH:** \`$SSH_RAW\`"
-            echo "- **Web:** $WEB_URL"
-          } >> "$GITHUB_STEP_SUMMARY"
 
       # ---------- BERSIHKAN STORAGE (ringan, tanpa boost) ----------
       - name: Bersihkan storage runner
@@ -116,7 +112,7 @@ jobs:
                       /usr/share/swift /usr/local/share/boost /opt/microsoft \
                       /usr/local/share/chromium || true
           sudo docker image prune --all --force > /dev/null 2>&1 || true
-          sudo -E apt-get clean || true
+          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=a apt-get clean || true
           echo "=== Sesudah ==="; df -h /
 
           # kapasitas node dihitung dari ruang kosong di disk /
@@ -139,7 +135,7 @@ jobs:
           export NEEDRESTART_MODE=a
 
           curl -fsSL -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo -E dpkg -i cloudflared.deb < /dev/null
+          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=a dpkg -i cloudflared.deb < /dev/null
 
       - name: Start tunnel panel dan node (quick tunnel)
         if: env.USE_CF != 'true'
